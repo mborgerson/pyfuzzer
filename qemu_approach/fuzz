@@ -115,7 +115,7 @@ class Program(threading.Thread):
         print('[*] Launching fork server with command', ' '.join(cmd))
         os.environ[SHM_ENV_VAR] = str(shm.shmid)
         self._proc = subprocess.Popen(cmd,
-            stdout=open('/dev/null'),
+            stdout=open('/dev/null'), # Sink program output to /dev/null
             stdin=open('/dev/null'),
             stderr=open('/dev/null'))
         if VERBOSE:
@@ -125,18 +125,18 @@ class Program(threading.Thread):
         os.read(FORKSRV_FD+1, 4)
         print('Ok')
 
-        accum = 0.0
-
         # Spawn some childen
         counter = 0
         gstart = time.time()
-        while (time.time() - gstart) < 10.0:
+        while (time.time() - gstart) < 1.0:
             # Spawn child
-            if VERBOSE: sys.stdout.write('[*] Launching #%d ' % i)
+            if VERBOSE:
+                sys.stdout.write('[*] Launching #%d ' % i)
             start = time.time()
             os.write(FORKSRV_FD, '0000')
             inst_pid_enc = os.read(FORKSRV_FD+1, 4)
-            if VERBOSE: print('(pid = %d)' % struct.unpack('<I', inst_pid_enc))
+            if VERBOSE:
+                print('(pid = %d)' % struct.unpack('<I', inst_pid_enc))
 
             # Wait for child to exit
             exit_enc = os.read(FORKSRV_FD+1, 4)
@@ -145,14 +145,15 @@ class Program(threading.Thread):
             if VERBOSE: sys.stdout.write('[*] Exit Status: %d ' % status)
             exit_signal = status & 0x7f
             if exit_signal == 0:
-                if VERBOSE: print('Exit Normal, Code = %d)' % ((status & 0xff00) >> 8))
+                if VERBOSE:
+                    print('(Exit Normal, Code = %d)' % ((status & 0xff00) >> 8))
             else:
                 # core_dump = status & 0x80
-                if VERBOSE: print('(Process Terminated, Signal = %d)' % exit_signal)
+                if VERBOSE:
+                    print('(Process Terminated, Signal = %d)' % exit_signal)
             if VERBOSE: print('[*] Process executed for %f seconds' % (stop-start))
-            accum += stop-start
             counter += 1
-        print('[*] Executed %d times in %f seconds' % (counter, accum))
+        print('[*] Executed %d times' % (counter))
 
         if VERBOSE:
             print('Shared Memory:')
@@ -181,13 +182,14 @@ class Program(threading.Thread):
 def main():
     a = argparse.ArgumentParser()
     a.add_argument('target',            help='target executable')
+    a.add_argument('args',              help='target arguments (@@ for input file)', nargs='?')
     a.add_argument('-i', '--inputdir',  help='seed input directory')
     a.add_argument('-o', '--outputdir', help='output data directory')
     a.add_argument('-v', '--verbose',   help='print debug output', action='store_true')
-    a.add_argument('args',              help='target arguments (@@ for input file)')
     a.set_defaults(target='a.out', inputdir='', outputdir='output', args='')
     args = a.parse_args()
 
+    global VERBOSE
     VERBOSE = args.verbose
     p = Program(args.target, shlex.split(args.args))
 
