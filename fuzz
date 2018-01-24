@@ -88,24 +88,69 @@ class Program(threading.Thread):
         self._args = args or []
         self._stop_event = threading.Event()
         self._time_start = 0
-        self._time_since_last_new_path = 0
-        self._num_paths_found = 0
+        self._num_paths = 0
+        self._last_path_time = 0.0
         self._num_crashes = 0
+        self._last_crash_time = 0.0
         self._num_executions = 0
 
-        self._stat_update_interval = 0.5
+        self._stat_update_interval = 0.25
         self._stat_update_last = 0
+        self._stat_display_wheel_iter = 0
     
+    def time_elapsed_to_str(self, seconds):
+        sec_per_min = 60
+        sec_per_hour = sec_per_min * 60
+        seconds = int(seconds)
+        hours = int(seconds / sec_per_hour)
+        seconds -= hours * sec_per_hour
+        minutes = int(seconds / sec_per_min)
+        seconds -= minutes * sec_per_min
+        s = ''
+        if hours > 0: s += '%dh' % hours
+        if minutes > 0: s += '%dm' % minutes
+        s += '%ds' % seconds
+        return s
+
+    def display_stats(self):
+        wheel_icon = [
+            '[.  ]',
+            '[ . ]',
+            '[  .]',
+            '[ . ]',
+        ]
+        now = time.time()
+        sys.stdout.write('\r' + ' ' * 80 + '\r') # Hacky terminal line blanker
+        last_path_timestamp = 'N/A'
+        if self._last_path_time > 0:
+            last_path_timestamp = self.time_elapsed_to_str(now - self._last_path_time)
+        last_crash_timestamp = 'N/A'
+        if self._last_crash_time > 0:
+            last_crash_timestamp = self.time_elapsed_to_str(now - self._last_crash_time)
+        sys.stdout.write('%s %7s %6d exe, %4d paths (%s), %4d crashes (%s)' % (
+            wheel_icon[self._stat_display_wheel_iter],
+            self.time_elapsed_to_str(now - self._time_start),
+            self._num_executions,
+            self._num_paths, last_path_timestamp,
+            self._num_crashes, last_crash_timestamp))
+        self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
+        sys.stdout.flush()
+
+        #self._num_paths += 1
+        #self._last_path_time = now
+        #self._num_crashes += 1
+        #self._last_crash_time = now
+
     def run(self):
         # Init shared memory region
-        print('[*] Initializing shared memory')
+        print('[ * ] Initializing shared memory')
         shm = SharedMem(MAP_SIZE)
         shm_buf = (ctypes.c_uint8 * MAP_SIZE).from_address(shm.ptr)
         for i in range(MAP_SIZE):
             shm_buf[i] = 0
 
         # Init fork server communication fifos
-        print('[*] Creating fork server FIFOs')
+        print('[ * ] Creating fork server FIFOs')
 
         # FIFO1: fork server will read from this fifo before launching a new
         # fork. Stuff in 4 bytes to launch a fork.
@@ -127,7 +172,7 @@ class Program(threading.Thread):
 
         # Fire up the fork sesrver
         cmd = ['./qemu-x86_64', self._prog] + self._args
-        print('[*] Launching fork server with command', ' '.join(cmd))
+        print('[ * ] Launching fork server with command', ' '.join(cmd))
         os.environ[SHM_ENV_VAR] = str(shm.shmid)
         self._proc = subprocess.Popen(cmd,
             stdout=open('/dev/null'), # Sink program output to /dev/null
@@ -136,20 +181,20 @@ class Program(threading.Thread):
         if VERBOSE:
             print('    Shared Memory Segment Id: %d' % shm.shmid)
             print('    Fork server pid: %d' % self._proc.pid)
-        sys.stdout.write('[*] Wating for fork server to become ready... ')
+        sys.stdout.write('[ * ] Wating for fork server to become ready... ')
         os.read(FORKSRV_FD+1, 4)
         print('Ok')
 
         # Spawn some childen
         self._time_start = time.time()
-        print('[*] Starting!')
-        while (time.time() - self._time_start) < 4.0:
+        print('[ * ] Starting!')
+        while True: #(time.time() - self._time_start) < 4.0:
             if self._stop_event.is_set():
                 break
 
             # Spawn child
             if VERBOSE:
-                sys.stdout.write('[*] Launching #%d ' % self._num_executions)
+                sys.stdout.write('[ * ] Launching #%d ' % self._num_executions)
             start = time.time()
             os.write(FORKSRV_FD, '0000')
             inst_pid_enc = os.read(FORKSRV_FD+1, 4)
@@ -160,7 +205,7 @@ class Program(threading.Thread):
             exit_enc = os.read(FORKSRV_FD+1, 4)
             stop = time.time()
             status = struct.unpack('<I', exit_enc)[0]
-            if VERBOSE: sys.stdout.write('[*] Exit Status: %d ' % status)
+            if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % status)
             exit_signal = status & 0x7f
             if exit_signal == 0:
                 if VERBOSE:
@@ -170,10 +215,15 @@ class Program(threading.Thread):
                 if VERBOSE:
                     print('(Process Terminated, Signal = %d)' % exit_signal)
 
-            if VERBOSE: print('[*] Process executed for %f seconds' % (stop-start))
+            if VERBOSE: print('[ * ] Process executed for %f seconds' % (stop-start))
             self._num_executions += 1
 
-        print('[*] Executed %d times' % self._num_executions)
+            if (time.time() - self._stat_update_last) > self._stat_update_interval:
+                self._stat_update_last = time.time()
+                self.display_stats()
+
+
+        print('[ * ] Executed %d times' % self._num_executions)
 
         if VERBOSE:
             print('Shared Memory:')
