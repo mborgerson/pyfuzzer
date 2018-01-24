@@ -113,12 +113,7 @@ class Program(threading.Thread):
         return s
 
     def display_stats(self):
-        wheel_icon = [
-            '[.  ]',
-            '[ . ]',
-            '[  .]',
-            '[ . ]',
-        ]
+        wheel_icon = ['[.  ]','[ . ]','[  .]','[ . ]']
         now = time.time()
         sys.stdout.write('\r' + ' ' * 80 + '\r') # Hacky terminal line blanker
         last_path_timestamp = 'N/A'
@@ -136,10 +131,10 @@ class Program(threading.Thread):
         self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
         sys.stdout.flush()
 
-        #self._num_paths += 1
-        #self._last_path_time = now
-        #self._num_crashes += 1
-        #self._last_crash_time = now
+        # self._num_paths += 1
+        # self._last_path_time = now
+        # self._num_crashes += 1
+        # self._last_crash_time = now
 
     def run(self):
         # Init shared memory region
