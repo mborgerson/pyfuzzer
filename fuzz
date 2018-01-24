@@ -18,6 +18,9 @@ FORKSRV_FD = 198
 SHM_ENV_VAR = '__AFL_SHM_ID'
 
 
+INPUT_FILENAME = '__input_file'
+
+
 ###
 ### Following code is borrowed from https://github.com/albertz/playground/blob/master/shared_mem.py
 ### It is used to call into libc to do shared memory mapping
@@ -81,39 +84,90 @@ class SharedMem:
 ### End
 ###
 
-class ExecutionTrace(object):
+class Trace(object):
     """Program execution trace container"""
 
-    def __init__(self):
-        pass
+    def __init__(self, buffer, did_crash, exit_signal, exit_code, duration):
+        self._buffer = buffer
+        self.did_crash = did_crash
+        self.exit_signal = exit_signal
+        self.exit_code = exit_code
+        self.duration = duration
 
     def compare_to(self, other):
         """Determine if this execution was interesting or not"""
-        # did this input exercise new paths?
-        # did this input move tuple to new bin?
-        pass
+        # FIXME: I think this could be better as # of bin changes to create a score
+        self_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        other_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        new_paths = False
+        new_bin_change = False
+        for i in range(MAP_SIZE):
+            # did this input exercise new paths?
+            # FIXME: redundant, we can roll this condition into the below...
+            if other_ptr[i] == 0 and self_ptr[i] != 0:
+                new_paths = True
+
+            # did this input move tuple to new bin?
+            if self.find_msb(self_ptr[i]) > self.find_msb(other_ptr[i]):
+                new_bin_change = True
+        
+        return new_paths or new_bin_change
     
     def get_number_of_paths(self):
-        """Determine how many paths were taken"""
-        pass
+        """Determine how many paths were taken by counting present tuples"""
+        ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        num_paths = 0
+        for i in range(MAP_SIZE):
+            if ptr[i] != 0:
+                num_paths += 1
+        return num_paths
 
     def combine_total_paths(self, other):
         """Combine other with this trace to determine total paths"""
-        pass
+        self_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        other_ptr = ctypes.cast(other._buffer, ctypes.POINTER(ctypes.c_uint8))
+        for i in range(MAP_SIZE):
+            self_ptr[i] = max(self_ptr[i], other_ptr[i])
+
+    def dump_map(self):
+        print('Shared Memory:')
+        for i in range(MAP_SIZE/16):
+            sys.stdout.write('%04x: ' % (i*16))
+            for j in range(16):
+                sys.stdout.write('%02x ' % self._buffer[i*16+j])
+            sys.stdout.write('\n')
+
+    def find_msb(self, x):
+        # Probably REALLY slow... is there a way to put x86 assembly in python? :)
+        msb = -1
+        while x > 0:
+            msb += 1
+            x >>= 1
+        return msb
 
 class TestCase(object):
     """Test case to execute"""
-    def __init__(self):
-        # Input file contents
-        pass
+    def __init__(self, data=None, name='Anon'):
+        self.data = data or bytearray()
     
     def write_input_file(self, path):
-        pass
+        with open(path, 'wb') as f:
+            f.write(self.data)
+    
+    @classmethod
+    def create_from_file(self, path):
+        with open(path, 'rb') as f:
+            data = bytearray(f.read())
+        return TestCase(data, name=os.path.basename(path))
+
+    def clone(self):
+         # The slice here forces copy of buffer
+        return TestCase(self.data[:])
 
 class MutationStrategy(object):
     """Generates a test case according to a specific strategy"""
 
-    def __init__(self):
+    def __init__(self, seed):
         pass
     
     def get_stats(self):
@@ -124,17 +178,59 @@ class MutationStrategy(object):
         """Returns a new TestCase or None"""
         pass
 
-class NullStrategy(MutationStrategy): pass
-class SequentialBitFlipStrategy(MutationStrategy): pass
+class NullStrategy(MutationStrategy):
+    """Just returns the input seed"""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.complete = False
+    
+    def get_stats(self):
+        """Returns (name, percent_complete)"""
+        return ('Null', 100 if self.complete else 0)
+
+    def gen_test(self):
+        """Returns a new TestCase or None"""
+        if self.complete:
+            return None
+        new_case = self.seed.clone()
+        self.complete = True
+        return new_case
+
+class SequentialBitFlipStrategy(MutationStrategy):
+    """Generates a test case according to sequential bit flipping strategy"""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.file_len = len(seed.data)
+        self.byte_pos = 0
+        self.bit_pos = 0
+    
+    def get_stats(self):
+        """Returns (name, percent_complete)"""
+        return ('SeqBitFlip', (int)(100.0 * self.byte_pos / self.file_len))
+
+    def gen_test(self):
+        """Returns a new TestCase or None"""
+        if self.byte_pos >= self.file_len:
+            # Strategy complete
+            return None
+        new_case = self.seed.clone()
+        new_case.data[self.byte_pos] ^= 1 << self.bit_pos
+        self.bit_pos += 1
+        if self.bit_pos > 7:
+            self.bit_pos = 0
+            self.byte_pos += 1
+        return new_case
+
 class SequentialAddSubStrategy(MutationStrategy): pass
 class SequentialInsertInterestingNumbersStrategy(MutationStrategy): pass
-
 #   - Sequential bit flips with varying lengths and stepovers,
 #   - Sequential addition and subtraction of small integers,
 #   - Sequential insertion of known interesting integers (0, 1, INT_MAX, etc),
 
 class Program(threading.Thread):
-    def __init__(self, prog, args=None):
+    def __init__(self, prog, args=None, seed_paths=[], outputdir='output'):
         super(Program, self).__init__()
         self._prog = prog
         self._args = args or []
@@ -148,6 +244,9 @@ class Program(threading.Thread):
         self._stat_update_interval = 0.25
         self._stat_update_last = 0
         self._stat_display_wheel_iter = 0
+        self._seeds = [TestCase.create_from_file(i) for i in seed_paths]
+        self._current_strategy = None
+        self._output_dir = outputdir
     
     def time_elapsed_to_str(self, seconds):
         sec_per_min = 60
@@ -173,18 +272,28 @@ class Program(threading.Thread):
         last_crash_timestamp = 'N/A'
         if self._last_crash_time > 0:
             last_crash_timestamp = self.time_elapsed_to_str(now - self._last_crash_time)
-        sys.stdout.write('%s %s, %d exe, %d paths (%s), %d crashes (%s)' % (
+        strategy_info = ''
+        if self._current_strategy:
+            strategy_info = '%s (%d%%)' % self._current_strategy.get_stats()
+        sys.stdout.write('%s %s, %d executions, %d paths (%s), %d crashes (%s), %s' % (
             wheel_icon[self._stat_display_wheel_iter],
             self.time_elapsed_to_str(now - self._time_start),
             self._num_executions,
             self._num_paths, last_path_timestamp,
-            self._num_crashes, last_crash_timestamp))
+            self._num_crashes, last_crash_timestamp,
+            strategy_info))
         self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
         sys.stdout.flush()
-        # self._num_paths += 1
-        # self._last_path_time = now
-        # self._num_crashes += 1
-        # self._last_crash_time = now
+
+    def clone_map(self):
+        # Create new string buffer and clone map_buf into new buffer
+        clone = ctypes.create_string_buffer(MAP_SIZE)
+        memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
+        return clone
+
+    def clear_map(self):
+        for i in range(MAP_SIZE):
+            self._shm_buf[i] = 0
 
     def init(self):
         # Init shared memory region
@@ -216,6 +325,9 @@ class Program(threading.Thread):
         os.dup2(self._forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
 
         # Fire up the fork sesrver
+        for i, x in enumerate(self._args):
+            if x == '@@':
+                self._args[i] = INPUT_FILENAME
         cmd = ['./qemu-x86_64', self._prog] + self._args
         print('[ * ] Launching fork server with command', ' '.join(cmd))
         os.environ[SHM_ENV_VAR] = str(self._shm.shmid)
@@ -246,6 +358,14 @@ class Program(threading.Thread):
         # This is the main loop!
         self._time_start = time.time()
         print('[ * ] Starting! (C-c to exit!)')
+
+        baseline = None
+
+        queue = [s for s in self._seeds]
+        strategies = [NullStrategy, SequentialBitFlipStrategy]
+        import itertools
+        m = [s(t) for s, t in itertools.product(strategies, queue)] # Doesn't handle queue changing!
+
         while True:
             if self._stop_event.is_set(): break
 
@@ -255,16 +375,24 @@ class Program(threading.Thread):
             # if fuzzing input:
             #     generate new input according to strategy
             #     spawn child with new input
-            #     compare against existing trace to determine if interesting
-            #          does this input exercise new paths?
-            #          does this input move tuple to new bin?
-            #          did we crash and have we not seen a crash yet?
-            #     if interesting:
-            #         add to seed queue
+
+            if self._current_strategy is None:
+                if len(m) == 0:
+                    print('\n[ * ] End of tasks')
+                    break
+                self._current_strategy = m.pop(0)
+            
+            # Generate next test case
+            test_case = self._current_strategy.gen_test()
+            if test_case is None:
+                self._current_strategy = None
+                continue
+
+            test_case.write_input_file(INPUT_FILENAME)
+            self.clear_map()
 
             # Spawn child
-            if VERBOSE:
-                sys.stdout.write('[ * ] Launching #%d ' % self._num_executions)
+            if VERBOSE: sys.stdout.write('[ * ] Launching #%d ' % self._num_executions)
             start = time.time()
             os.write(FORKSRV_FD, '0000')
             inst_pid_enc = os.read(FORKSRV_FD+1, 4)
@@ -275,40 +403,72 @@ class Program(threading.Thread):
             exit_enc = os.read(FORKSRV_FD+1, 4)
             stop = time.time()
             status = struct.unpack('<I', exit_enc)[0]
-            if VERBOSE:
-                sys.stdout.write('[ * ] Exit Status: %d ' % status)
+            if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % status)
 
             exit_signal = status & 0x7f
             did_crash = exit_signal != 0
+            exit_code = (status & 0xff00) >> 8
+            did_core_dump = status & 0x80
 
             if did_crash:
-                # did_core_dump = status & 0x80
-                if VERBOSE:
-                    print('(Process Terminated, Signal = %d)' % exit_signal)
+                if VERBOSE: print('(Process Terminated, Signal = %d)' % exit_signal)
             else:
-                if VERBOSE:
-                    exit_code = (status & 0xff00) >> 8
-                    print('(Exit Normal, Code = %d)' % exit_code)
+                if VERBOSE: print('(Exit Normal, Code = %d)' % exit_code)
+            if VERBOSE: print('[ * ] Process executed for %f seconds' % (stop-start))
 
-            if VERBOSE:
-                print('[ * ] Process executed for %f seconds' % (stop-start))
+            # Create program trace object
+            trace = Trace(self.clone_map(),
+                did_crash=did_crash,
+                exit_signal=exit_signal,
+                exit_code=exit_code,
+                duration=(stop-start))
+
+            if baseline is None:
+                baseline = trace
+            else:
+                baseline.combine_total_paths(trace)
+
+            num_paths = baseline.get_number_of_paths()
+            if num_paths > self._num_paths:
+                self._num_paths = num_paths
+                self._last_path_time = time.time()
+
+            if did_crash:
+                self._num_crashes += 1
+                self._last_crash_time = time.time()
+
+                # Save this test case
+                output_dir_path = os.path.join(self._output_dir, "crash_%d" % self._num_crashes)
+                os.makedirs(os.path.join(self._output_dir, "crash_%d" % self._num_crashes))
+                test_case.write_input_file(os.path.join(output_dir_path, 'input'))
+
+                # Move core dump to crash directory
+                for f in os.listdir('.'):
+                    if f.endswith('.core'):
+                        os.rename(f, os.path.join(output_dir_path, os.path.basename(f)))
+
+                # FIXME: Save mutation log.. what did we do against seed to get here?
+                                   
+
+            if trace.compare_to(baseline):
+                print('This was interesting')
+            
+            del trace
+
+            #     compare against existing trace to determine if interesting
+            #          does this input exercise new paths?
+            #          does this input move tuple to new bin?
+            #          did we crash and have we not seen a crash yet?
+            #     if interesting:
+            #         add to seed queue
 
             # Display runtime statistics
             self._num_executions += 1
-            if (time.time() - self._stat_update_last) > self._stat_update_interval:
+            if True:#(time.time() - self._stat_update_last) > self._stat_update_interval:
                 self._stat_update_last = time.time()
                 self.display_stats()
 
-        print('')
         print('[ * ] Executed %d times' % self._num_executions)
-
-        # if VERBOSE:
-        #     print('Shared Memory:')
-        #     for i in range(MAP_SIZE/16):
-        #         sys.stdout.write('%04x: ' % (i*16))
-        #         for j in range(16):
-        #             sys.stdout.write('%02x ' % shm_buf[i*16+j])
-        #         sys.stdout.write('\n')
 
         self.cleanup()
 
@@ -327,9 +487,16 @@ def main():
     a.set_defaults(target='a.out', inputdir='', outputdir='output', args='')
     args = a.parse_args()
 
+    # Enable verbose logging
     global VERBOSE
     VERBOSE = args.verbose
-    p = Program(args.target, shlex.split(args.args))
+
+    # Gather inputs from inputdir
+    seed_paths = []
+    if args.inputdir:
+        seed_paths = [os.path.join(args.inputdir, p) for p in os.listdir(args.inputdir)]
+
+    p = Program(args.target, shlex.split(args.args), seed_paths, args.outputdir)
 
     try:
         p.start()
