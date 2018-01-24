@@ -86,6 +86,9 @@ class Program(threading.Thread):
         self._num_paths_found = 0
         self._num_crashes = 0
         self._num_executions = 0
+
+        self._stat_update_interval = 0.5
+        self._stat_update_last = 0
     
     def run(self):
         # Init shared memory region
