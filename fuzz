@@ -299,6 +299,7 @@ class Program(threading.Thread):
                 self._stat_update_last = time.time()
                 self.display_stats()
 
+        print('')
         print('[ * ] Executed %d times' % self._num_executions)
 
         # if VERBOSE:
@@ -335,7 +336,6 @@ def main():
         while p.isAlive():
             p.join(1)
     except KeyboardInterrupt as e:
-        print('\nShutting Down!\n')
         p.stop()
     p.stop()
 
