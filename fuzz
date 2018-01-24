@@ -186,49 +186,62 @@ class Program(threading.Thread):
         # self._num_crashes += 1
         # self._last_crash_time = now
 
-    def run(self):
+    def init(self):
         # Init shared memory region
         print('[ * ] Initializing shared memory')
-        shm = SharedMem(MAP_SIZE)
-        shm_buf = (ctypes.c_uint8 * MAP_SIZE).from_address(shm.ptr)
+        self._shm = SharedMem(MAP_SIZE)
+        self._shm_buf = (ctypes.c_uint8 * MAP_SIZE).from_address(self._shm.ptr)
         for i in range(MAP_SIZE):
-            shm_buf[i] = 0
+            self._shm_buf[i] = 0
 
         # Init fork server communication fifos
         print('[ * ] Creating fork server FIFOs')
 
-        # FIFO1: fork server will read from this fifo before launching a new
-        # fork. Stuff in 4 bytes to launch a fork.
+        # FIFO #1: The fork server will read from this fifo before launching a
+        # new fork. Stuff in 4 bytes to launch a fork.
         if os.path.exists('forksrv_in'):
             os.unlink('forksrv_in')
         os.mkfifo('forksrv_in')
-        forksrv_in_fd = os.open('forksrv_in', os.O_RDWR)
-        os.dup2(forksrv_in_fd, FORKSRV_FD) # QEMU expects this fd to be FORKSRV_FD
+        self._forksrv_in_fd = os.open('forksrv_in', os.O_RDWR)
+        os.dup2(self._forksrv_in_fd, FORKSRV_FD) # QEMU expects this fd to be FORKSRV_FD
 
-        # FIFO2: fork server will write to this fifo
-        # -- Garbage at startup to see if it's alive
-        # -- Child PID
-        # -- Exit status of child
+        # FIFO #2: The fork server will write to this fifo:
+        #          - 4 bytes of garbage at startup to see if it's alive
+        #          - The 4 byte pid of the child once it is created
+        #          - The 4 byte exit status of child
         if os.path.exists('forksrv_out'):
             os.unlink('forksrv_out')
         os.mkfifo('forksrv_out')
-        forksrv_out_fd = os.open('forksrv_out', os.O_RDWR)
-        os.dup2(forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
+        self._forksrv_out_fd = os.open('forksrv_out', os.O_RDWR)
+        os.dup2(self._forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
 
         # Fire up the fork sesrver
         cmd = ['./qemu-x86_64', self._prog] + self._args
         print('[ * ] Launching fork server with command', ' '.join(cmd))
-        os.environ[SHM_ENV_VAR] = str(shm.shmid)
+        os.environ[SHM_ENV_VAR] = str(self._shm.shmid)
         self._proc = subprocess.Popen(cmd,
             stdout=open('/dev/null'), # Sink program output to /dev/null
             stdin=open('/dev/null'),
             stderr=open('/dev/null'))
         if VERBOSE:
-            print('    Shared Memory Segment Id: %d' % shm.shmid)
+            print('    Shared Memory Segment Id: %d' % self._shm.shmid)
             print('    Fork server pid: %d' % self._proc.pid)
         sys.stdout.write('[ * ] Wating for fork server to become ready... ')
         os.read(FORKSRV_FD+1, 4)
         print('Ok')
+
+    def cleanup(self):
+        if self._proc.poll() is None:
+            self._proc.kill()
+        os.close(self._forksrv_in_fd)
+        os.close(FORKSRV_FD)
+        os.close(self._forksrv_out_fd)
+        os.close(FORKSRV_FD+1)
+        os.unlink('forksrv_in')
+        os.unlink('forksrv_out')
+
+    def run(self):
+        self.init()
 
         # This is the main loop!
         self._time_start = time.time()
@@ -288,23 +301,15 @@ class Program(threading.Thread):
 
         print('[ * ] Executed %d times' % self._num_executions)
 
-        if VERBOSE:
-            print('Shared Memory:')
-            for i in range(MAP_SIZE/16):
-                sys.stdout.write('%04x: ' % (i*16))
-                for j in range(16):
-                    sys.stdout.write('%02x ' % shm_buf[i*16+j])
-                sys.stdout.write('\n')
+        # if VERBOSE:
+        #     print('Shared Memory:')
+        #     for i in range(MAP_SIZE/16):
+        #         sys.stdout.write('%04x: ' % (i*16))
+        #         for j in range(16):
+        #             sys.stdout.write('%02x ' % shm_buf[i*16+j])
+        #         sys.stdout.write('\n')
 
-        # Cleanup
-        if self._proc.poll() is None:
-            self._proc.kill()
-        os.close(forksrv_in_fd)
-        os.close(FORKSRV_FD)
-        os.close(forksrv_out_fd)
-        os.close(FORKSRV_FD+1)
-        os.unlink('forksrv_in')
-        os.unlink('forksrv_out')
+        self.cleanup()
 
     def stop(self):
         self._stop_event.set()
