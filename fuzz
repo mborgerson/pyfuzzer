@@ -54,11 +54,17 @@ memcpy = libc.memcpy
 memcpy.restype = ctypes.c_void_p
 memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 
+# key_t ftok(const char *pathname, int proj_id);
+ftok = libc.ftok
+ftok.restype = shm_key_t
+ftok.argtypes = (ctypes.c_char_p, ctypes.c_int)
+
+
 class SharedMem:
     def __init__(self, size):
         self.size = size
         self.shmid = shmget(IPC_PRIVATE, self.size, 0o600)
-        assert self.shmid > 0
+        assert self.shmid >= 0
         self.ptr = shmat(self.shmid, 0, 0)
         assert self.ptr
 
