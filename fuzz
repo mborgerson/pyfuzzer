@@ -81,6 +81,14 @@ class SharedMem:
 ### End
 ###
 
+class Trace(object):
+    def __init__(self):
+        pass
+
+class Mutator(object):
+    def __init__(self):
+        pass
+
 class Program(threading.Thread):
     def __init__(self, prog, args=None):
         super(Program, self).__init__()
@@ -93,7 +101,6 @@ class Program(threading.Thread):
         self._num_crashes = 0
         self._last_crash_time = 0.0
         self._num_executions = 0
-
         self._stat_update_interval = 0.25
         self._stat_update_last = 0
         self._stat_display_wheel_iter = 0
@@ -130,7 +137,6 @@ class Program(threading.Thread):
             self._num_crashes, last_crash_timestamp))
         self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
         sys.stdout.flush()
-
         # self._num_paths += 1
         # self._last_path_time = now
         # self._num_crashes += 1
@@ -180,12 +186,24 @@ class Program(threading.Thread):
         os.read(FORKSRV_FD+1, 4)
         print('Ok')
 
-        # Spawn some childen
+        # This is the main loop!
         self._time_start = time.time()
-        print('[ * ] Starting!')
-        while True: #(time.time() - self._time_start) < 4.0:
-            if self._stop_event.is_set():
-                break
+        print('[ * ] Starting! (C-c to exit!)')
+        while True:
+            if self._stop_event.is_set(): break
+
+            # if no active fuzzing target:
+            #     remove from seed queue
+            #     set active fuzzing target
+            # if fuzzing input:
+            #     generate new input according to strategy
+            #     spawn child with new input
+            #     compare against existing trace to determine if interesting
+            #          does this input exercise new paths?
+            #          does this input move tuple to new bin?
+            #          did we crash and have we not seen a crash yet?
+            #     if interesting:
+            #         add to seed queue
 
             # Spawn child
             if VERBOSE:
@@ -200,23 +218,29 @@ class Program(threading.Thread):
             exit_enc = os.read(FORKSRV_FD+1, 4)
             stop = time.time()
             status = struct.unpack('<I', exit_enc)[0]
-            if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % status)
+            if VERBOSE:
+                sys.stdout.write('[ * ] Exit Status: %d ' % status)
+
             exit_signal = status & 0x7f
-            if exit_signal == 0:
-                if VERBOSE:
-                    print('(Exit Normal, Code = %d)' % ((status & 0xff00) >> 8))
-            else:
-                # core_dump = status & 0x80
+            did_crash = exit_signal != 0
+
+            if did_crash:
+                # did_core_dump = status & 0x80
                 if VERBOSE:
                     print('(Process Terminated, Signal = %d)' % exit_signal)
+            else:
+                if VERBOSE:
+                    exit_code = (status & 0xff00) >> 8
+                    print('(Exit Normal, Code = %d)' % exit_code)
 
-            if VERBOSE: print('[ * ] Process executed for %f seconds' % (stop-start))
+            if VERBOSE:
+                print('[ * ] Process executed for %f seconds' % (stop-start))
+
+            # Display runtime statistics
             self._num_executions += 1
-
             if (time.time() - self._stat_update_last) > self._stat_update_interval:
                 self._stat_update_last = time.time()
                 self.display_stats()
-
 
         print('[ * ] Executed %d times' % self._num_executions)
 
