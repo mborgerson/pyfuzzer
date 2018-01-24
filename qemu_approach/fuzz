@@ -80,6 +80,12 @@ class Program(threading.Thread):
         super(Program, self).__init__()
         self._prog = prog
         self._args = args or []
+        self._stop_event = threading.Event()
+        self._time_start = 0
+        self._time_since_last_new_path = 0
+        self._num_paths_found = 0
+        self._num_crashes = 0
+        self._num_executions = 0
     
     def run(self):
         # Init shared memory region
@@ -92,23 +98,23 @@ class Program(threading.Thread):
         # Init fork server communication fifos
         print('[*] Creating fork server FIFOs')
 
-        # FIFO1: Forkserver will read from this fifo before launching a new
-        # fork. Return 4 bytes to launch a fork.
-        if os.path.exists('fifo1'):
-            os.unlink('fifo1')
-        os.mkfifo('fifo1')
-        fd1 = os.open('fifo1', os.O_RDWR)
-        os.dup2(fd1, FORKSRV_FD)
+        # FIFO1: fork server will read from this fifo before launching a new
+        # fork. Stuff in 4 bytes to launch a fork.
+        if os.path.exists('forksrv_in'):
+            os.unlink('forksrv_in')
+        os.mkfifo('forksrv_in')
+        forksrv_in_fd = os.open('forksrv_in', os.O_RDWR)
+        os.dup2(forksrv_in_fd, FORKSRV_FD) # QEMU expects this fd to be FORKSRV_FD
 
-        # FIFO1: Forkserver will write to this fifo
+        # FIFO2: fork server will write to this fifo
         # -- Garbage at startup to see if it's alive
         # -- Child PID
         # -- Exit status of child
-        if os.path.exists('fifo2'):
-            os.unlink('fifo2')
-        os.mkfifo('fifo2')
-        fd2 = os.open('fifo2', os.O_RDWR)
-        os.dup2(fd2, FORKSRV_FD+1)
+        if os.path.exists('forksrv_out'):
+            os.unlink('forksrv_out')
+        os.mkfifo('forksrv_out')
+        forksrv_out_fd = os.open('forksrv_out', os.O_RDWR)
+        os.dup2(forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
 
         # Fire up the fork sesrver
         cmd = ['./qemu-x86_64', self._prog] + self._args
@@ -126,12 +132,15 @@ class Program(threading.Thread):
         print('Ok')
 
         # Spawn some childen
-        counter = 0
-        gstart = time.time()
-        while (time.time() - gstart) < 1.0:
+        self._time_start = time.time()
+        print('[*] Starting!')
+        while (time.time() - self._time_start) < 4.0:
+            if self._stop_event.is_set():
+                break
+
             # Spawn child
             if VERBOSE:
-                sys.stdout.write('[*] Launching #%d ' % i)
+                sys.stdout.write('[*] Launching #%d ' % self._num_executions)
             start = time.time()
             os.write(FORKSRV_FD, '0000')
             inst_pid_enc = os.read(FORKSRV_FD+1, 4)
@@ -151,9 +160,11 @@ class Program(threading.Thread):
                 # core_dump = status & 0x80
                 if VERBOSE:
                     print('(Process Terminated, Signal = %d)' % exit_signal)
+
             if VERBOSE: print('[*] Process executed for %f seconds' % (stop-start))
-            counter += 1
-        print('[*] Executed %d times' % (counter))
+            self._num_executions += 1
+
+        print('[*] Executed %d times' % self._num_executions)
 
         if VERBOSE:
             print('Shared Memory:')
@@ -163,21 +174,20 @@ class Program(threading.Thread):
                     sys.stdout.write('%02x ' % shm_buf[i*16+j])
                 sys.stdout.write('\n')
 
-        os.close(fd1)
-        os.close(FORKSRV_FD)
-        os.close(fd2)
-        os.close(FORKSRV_FD+1)
-
-        # Kill off the forkserver
-        self._proc.kill()
-
         # Cleanup
-        os.unlink('fifo1')
-        os.unlink('fifo2')
-
-    def stop(self):
         if self._proc.poll() is None:
             self._proc.kill()
+        os.close(forksrv_in_fd)
+        os.close(FORKSRV_FD)
+        os.close(forksrv_out_fd)
+        os.close(FORKSRV_FD+1)
+        os.unlink('forksrv_in')
+        os.unlink('forksrv_out')
+
+    def stop(self):
+        self._stop_event.set()
+        # if self._proc.poll() is None:
+        #     self._proc.kill()
 
 def main():
     a = argparse.ArgumentParser()
@@ -195,9 +205,11 @@ def main():
 
     try:
         p.start()
-        p.join()
+        while p.isAlive():
+            p.join(1)
     except KeyboardInterrupt as e:
-        pass
+        print('\nShutting Down!\n')
+        p.stop()
     p.stop()
 
 if __name__ == '__main__':
