@@ -57,6 +57,11 @@ memcpy = libc.memcpy
 memcpy.restype = ctypes.c_void_p
 memcpy.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 
+# void* memcmp( void *dest, const void *src, size_t count );
+memcmp = libc.memcmp
+memcmp.restype = ctypes.c_int
+memcmp.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+
 # key_t ftok(const char *pathname, int proj_id);
 ftok = libc.ftok
 ftok.restype = shm_key_t
@@ -98,7 +103,9 @@ class Trace(object):
         """Determine if this execution was interesting or not"""
         # FIXME: I think this could be better as # of bin changes to create a score
         self_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
-        other_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        other_ptr = ctypes.cast(other._buffer, ctypes.POINTER(ctypes.c_uint8))
+        # return memcmp(ctypes.byref(self._buffer), ctypes.byref(other._buffer), MAP_SIZE) == 0
+
         new_paths = False
         new_bin_change = False
         for i in range(MAP_SIZE):
@@ -110,7 +117,7 @@ class Trace(object):
             # did this input move tuple to new bin?
             if self.find_msb(self_ptr[i]) > self.find_msb(other_ptr[i]):
                 new_bin_change = True
-        
+
         return new_paths or new_bin_change
     
     def get_number_of_paths(self):
@@ -250,6 +257,9 @@ class Program(threading.Thread):
         self._seeds = [TestCase.create_from_file(i) for i in seed_paths]
         self._current_strategy = None
         self._output_dir = outputdir
+        self._strategies = [NullStrategy, SequentialBitFlipStrategy]
+        self._test_queue = []
+        self._strategy_queue = []
     
     def time_elapsed_to_str(self, seconds):
         sec_per_min = 60
@@ -266,7 +276,7 @@ class Program(threading.Thread):
         return s
 
     def display_stats(self):
-        wheel_icon = ['[.  ]','[ . ]','[  .]','[ . ]']
+        wheel_icon = ['[ - ]','[  -]','[ - ]','[-  ]']
         now = time.time()
         sys.stdout.write('\r' + ' ' * 80 + '\r') # Hacky terminal line blanker
         last_path_timestamp = 'N/A'
@@ -278,12 +288,13 @@ class Program(threading.Thread):
         strategy_info = ''
         if self._current_strategy:
             strategy_info = '%s (%d%%)' % self._current_strategy.get_stats()
-        sys.stdout.write('%s %s, %d executions, %d paths (%s), %d crashes (%s), %s' % (
+        sys.stdout.write('%s %s, %d execs, %d paths (%s), %d crashes (%s), %d/%d, %s' % (
             wheel_icon[self._stat_display_wheel_iter],
             self.time_elapsed_to_str(now - self._time_start),
             self._num_executions,
             self._num_paths, last_path_timestamp,
             self._num_crashes, last_crash_timestamp,
+            len(self._test_queue), len(self._strategy_queue),
             strategy_info))
         self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
         sys.stdout.flush()
@@ -292,6 +303,7 @@ class Program(threading.Thread):
         # Create new string buffer and clone map_buf into new buffer
         clone = ctypes.create_string_buffer(MAP_SIZE)
         memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
+        assert(memcmp(ctypes.byref(clone), self._shm.ptr, MAP_SIZE) == 0)
         return clone
 
     def clear_map(self):
@@ -354,6 +366,8 @@ class Program(threading.Thread):
         os.close(FORKSRV_FD+1)
         os.unlink('forksrv_in')
         os.unlink('forksrv_out')
+        if os.path.exists(INPUT_FILENAME):
+            os.unlink(INPUT_FILENAME)
 
     def run(self):
         self.init()
@@ -363,27 +377,27 @@ class Program(threading.Thread):
         print('[ * ] Starting! (C-c to exit!)')
 
         baseline = None
-
-        queue = [s for s in self._seeds]
-        strategies = [NullStrategy, SequentialBitFlipStrategy]
-        import itertools
-        m = [s(t) for s, t in itertools.product(strategies, queue)] # Doesn't handle queue changing!
+        self._test_queue = [s for s in self._seeds]
+        self._strategy_queue = []
 
         while True:
-            if self._stop_event.is_set(): break
-
-            # if no active fuzzing target:
-            #     remove from seed queue
-            #     set active fuzzing target
-            # if fuzzing input:
-            #     generate new input according to strategy
-            #     spawn child with new input
+            if self._stop_event.is_set():
+                # A stop was requested!
+                break
 
             if self._current_strategy is None:
-                if len(m) == 0:
-                    print('\n[ * ] End of tasks')
-                    break
-                self._current_strategy = m.pop(0)
+                if len(self._strategy_queue) == 0:
+                    # Try to fill up local queue
+                    if len(self._test_queue) == 0:
+                        print('\n[ * ] End of tasks')
+                        break
+                
+                    # Build queue of strategies to try for this queued test case
+                    t = self._test_queue.pop(0)
+                    self._strategy_queue = [s(t) for s in self._strategies]
+
+                # Get next strategy
+                self._current_strategy = self._strategy_queue.pop(0)
             
             # Generate next test case
             test_case = self._current_strategy.gen_test()
@@ -428,13 +442,6 @@ class Program(threading.Thread):
 
             if baseline is None:
                 baseline = trace
-            else:
-                baseline.combine_total_paths(trace)
-
-            num_paths = baseline.get_number_of_paths()
-            if num_paths > self._num_paths:
-                self._num_paths = num_paths
-                self._last_path_time = time.time()
 
             if did_crash:
                 self._num_crashes += 1
@@ -454,17 +461,21 @@ class Program(threading.Thread):
                 with open(os.path.join(output_dir_path, 'mutations.txt'), 'wb') as f:
                     f.write(test_case.mutations)
 
-            if trace.compare_to(baseline):
-                print('This was interesting')
-            
-            del trace
+                # assert trace.compare_to(baseline)
 
-            #     compare against existing trace to determine if interesting
-            #          does this input exercise new paths?
-            #          does this input move tuple to new bin?
-            #          did we crash and have we not seen a crash yet?
-            #     if interesting:
-            #         add to seed queue
+            else:
+                # Didn't cause a crash, but could be interesting?
+                if trace.compare_to(baseline):
+                    print('\nHmm, that\'s interesting...')
+                    self._test_queue.append(test_case)
+
+            baseline.combine_total_paths(trace)
+            num_paths = baseline.get_number_of_paths()
+            if num_paths > self._num_paths:
+                self._num_paths = num_paths
+                self._last_path_time = time.time()
+
+            del trace
 
             # Display runtime statistics
             self._num_executions += 1
