@@ -147,8 +147,10 @@ class Trace(object):
 
 class TestCase(object):
     """Test case to execute"""
-    def __init__(self, data=None, name='Anon'):
+    def __init__(self, data=None, name='Anon', mutations=''):
         self.data = data or bytearray()
+        self.name = name
+        self.mutations = mutations
     
     def write_input_file(self, path):
         with open(path, 'wb') as f:
@@ -162,7 +164,7 @@ class TestCase(object):
 
     def clone(self):
          # The slice here forces copy of buffer
-        return TestCase(self.data[:])
+        return TestCase(self.data[:], name=self.name, mutations=self.mutations)
 
 class MutationStrategy(object):
     """Generates a test case according to a specific strategy"""
@@ -217,6 +219,7 @@ class SequentialBitFlipStrategy(MutationStrategy):
             return None
         new_case = self.seed.clone()
         new_case.data[self.byte_pos] ^= 1 << self.bit_pos
+        new_case.mutations += 'flip byte %x, bit %d\n' % (self.byte_pos, self.bit_pos)
         self.bit_pos += 1
         if self.bit_pos > 7:
             self.bit_pos = 0
@@ -447,8 +450,9 @@ class Program(threading.Thread):
                     if f.endswith('.core'):
                         os.rename(f, os.path.join(output_dir_path, os.path.basename(f)))
 
-                # FIXME: Save mutation log.. what did we do against seed to get here?
-                                   
+                # Save which mutations were done against original seed
+                with open(os.path.join(output_dir_path, 'mutations.txt'), 'wb') as f:
+                    f.write(test_case.mutations)
 
             if trace.compare_to(baseline):
                 print('This was interesting')
