@@ -234,7 +234,30 @@ class SequentialBitFlipStrategy(MutationStrategy):
         return new_case
 
 class SequentialAddSubStrategy(MutationStrategy): pass
-class SequentialInsertInterestingNumbersStrategy(MutationStrategy): pass
+
+class SequentialInsertInterestingNumbersStrategy(MutationStrategy):
+    """Generates a test case according to sequential bit flipping strategy"""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.file_len = len(seed.data)
+        self.byte_pos = 0
+    
+    def get_stats(self):
+        """Returns (name, percent_complete)"""
+        return ('InsBigNums', (int)(100.0 * self.byte_pos / self.file_len))
+
+    def gen_test(self):
+        """Returns a new TestCase or None"""
+        if self.byte_pos >= self.file_len-4:
+            # Strategy complete
+            return None
+        new_case = self.seed.clone()
+        new_case.data[self.byte_pos:self.byte_pos+4] = b'\xff\xff\xff\x7f'
+        new_case.mutations += 'set byte %x to +4 = 0xffffffff\n' % (self.byte_pos)
+        self.byte_pos += 1
+        return new_case
+
 #   - Sequential bit flips with varying lengths and stepovers,
 #   - Sequential addition and subtraction of small integers,
 #   - Sequential insertion of known interesting integers (0, 1, INT_MAX, etc),
@@ -257,7 +280,7 @@ class Program(threading.Thread):
         self._seeds = [TestCase.create_from_file(i) for i in seed_paths]
         self._current_strategy = None
         self._output_dir = outputdir
-        self._strategies = [NullStrategy, SequentialBitFlipStrategy]
+        self._strategies = [NullStrategy, SequentialInsertInterestingNumbersStrategy, SequentialBitFlipStrategy]
         self._test_queue = []
         self._strategy_queue = []
     
@@ -466,7 +489,7 @@ class Program(threading.Thread):
             else:
                 # Didn't cause a crash, but could be interesting?
                 if trace.compare_to(baseline):
-                    print('\nHmm, that\'s interesting...')
+                    # print('\nHmm, that\'s interesting...')
                     self._test_queue.append(test_case)
 
             baseline.combine_total_paths(trace)
