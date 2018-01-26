@@ -11,6 +11,7 @@ import ctypes
 import os
 import os.path
 import shlex
+import select
 
 VERBOSE = False
 MAP_SIZE = 64*1024
@@ -409,9 +410,17 @@ class Program(threading.Thread):
         if VERBOSE:
             print('    Shared Memory Segment Id: %d' % self._shm.shmid)
             print('    Fork server pid: %d' % self._proc.pid)
-        sys.stdout.write('[ * ] Wating for fork server to become ready... ')
+        print('[ * ] Wating for fork server to become ready... ')
+        while True:
+            # Tight loop to wait for the fork server to come up. Select on the
+            # fifo to see if it's ready yet, and at the same time check to see
+            # if the process exited early (probably due to command line args)
+            r, w, x = select.select([FORKSRV_FD+1], [], [], 0)
+            if len(r) > 0: break
+            if self._proc.poll():
+                print('[ ! ] Fork server exited prematurely (code %d)' % self._proc.returncode)
+                sys.exit(1)
         os.read(FORKSRV_FD+1, 4)
-        print('Ok')
 
     def cleanup(self):
         if self._proc.poll() is None:
