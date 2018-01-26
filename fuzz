@@ -558,14 +558,32 @@ class Program(threading.Thread):
         #     self._proc.kill()
 
 def main():
-    a = argparse.ArgumentParser()
-    a.add_argument('target',            help='target executable')
-    a.add_argument('args',              help='target arguments (@@ for input file)', nargs='?')
-    a.add_argument('-i', '--inputdir',  help='seed input directory')
+    # Mirror AFL usage. Save everything before '--' and pass it through the
+    # argument parser, everything after should be process arguments.
+    fuzz_args = []
+    prog_args = []
+    for i, v in enumerate(sys.argv):
+        if v == '--':
+            fuzz_args = sys.argv[1:i]
+            prog_args = sys.argv[i+1:]
+            break
+    if len(fuzz_args) == 0:
+        fuzz_args = sys.argv[1:]
+
+    description = 'This program performs fuzzing of inputs to an arbitrary binary.'
+    usage = sys.argv[0] + ' -i <testcase_dir> -o <findings_dir> [options] -- /path/to/fuzzed/app [params]'
+    a = argparse.ArgumentParser(description=description, usage=usage)
+    a.add_argument('-i', '--inputdir',  required=True, help='seed input directory')
     a.add_argument('-o', '--outputdir', help='output data directory')
     a.add_argument('-v', '--verbose',   help='print debug output', action='store_true')
-    a.set_defaults(target='a.out', inputdir='', outputdir='output', args='')
-    args = a.parse_args()
+    a.set_defaults(inputdir='', outputdir='output')
+    args = a.parse_args(fuzz_args)
+
+    if len(prog_args) < 1:
+        a.print_usage()
+        sys.stderr.write('%s: error: please provide path to target\n' % os.path.basename(sys.argv[0]))
+        sys.exit(1)
+    target = prog_args[0]
 
     # Enable verbose logging
     global VERBOSE
@@ -576,7 +594,7 @@ def main():
     if args.inputdir:
         seed_paths = [os.path.join(args.inputdir, p) for p in os.listdir(args.inputdir)]
 
-    p = Program(args.target, shlex.split(args.args), seed_paths, args.outputdir)
+    p = Program(target, prog_args[1:], seed_paths, args.outputdir)
 
     try:
         p.start()
