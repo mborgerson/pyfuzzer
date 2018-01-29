@@ -12,6 +12,7 @@ import os
 import os.path
 import shlex
 import select
+import binascii
 
 VERBOSE = False
 MAP_SIZE = 64*1024
@@ -99,6 +100,12 @@ class Trace(object):
         self.exit_signal = exit_signal
         self.exit_code = exit_code
         self.duration = duration
+        self.crc = self._checksum()
+
+    def _checksum(self):
+        """Calculate 32-bit checksum over the map buffer"""
+        self_ptr = ctypes.cast(self._buffer, ctypes.POINTER(ctypes.c_uint8))
+        return binascii.crc32(self_ptr)
 
     def compare_to(self, other):
         """Determine if this execution was interesting or not"""
