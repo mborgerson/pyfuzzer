@@ -299,31 +299,158 @@ class SequentialRuns(MutationStrategy):
 
         return new_case
 
-#   - Sequential bit flips with varying lengths and stepovers,
-#   - Sequential addition and subtraction of small integers,
-#   - Sequential insertion of known interesting integers (0, 1, INT_MAX, etc),
+class Backend(object):
+    def __init__(self, target):
+        self.target = target
+        self._prog = target
+        self._args = []
+    
+    def spawn(self):
+        """Spawn a new instance of the target"""
+        pass
 
-class Program(threading.Thread):
-    def __init__(self, prog, args=None, seed_paths=[], outputdir='output'):
-        super(Program, self).__init__()
-        self._prog = prog
-        self._args = args or []
-        self._stop_event = threading.Event()
-        self._time_start = 0
-        self._num_paths = 0
-        self._last_path_time = 0.0
-        self._num_crashes = 0
-        self._last_crash_time = 0.0
-        self._num_executions = 0
-        self._stat_update_interval = 0.25
-        self._stat_update_last = 0
+    def get_last_trace(self):
+        """Get the trace recorded by the last execution of the program"""
+        pass
+
+class QemuBackend(Backend):
+    def __init__(self, target):
+        super(QemuBackend, self).__init__(target)
+    
+    def initialize(self):
+        # Init shared memory region
+        print('[ * ] Initializing shared memory')
+        self._shm = SharedMem(MAP_SIZE)
+        self._shm_buf = (ctypes.c_uint8 * MAP_SIZE).from_address(self._shm.ptr)
+        for i in range(MAP_SIZE):
+            self._shm_buf[i] = 0
+
+        # Init fork server communication fifos
+        print('[ * ] Creating fork server FIFOs')
+
+        # FIFO #1: The fork server will read from this fifo before launching a
+        # new fork. Stuff in 4 bytes to launch a fork.
+        if os.path.exists('forksrv_in'):
+            os.unlink('forksrv_in')
+        os.mkfifo('forksrv_in')
+        self._forksrv_in_fd = os.open('forksrv_in', os.O_RDWR)
+        os.dup2(self._forksrv_in_fd, FORKSRV_FD) # QEMU expects this fd to be FORKSRV_FD
+
+        # FIFO #2: The fork server will write to this fifo:
+        #          - 4 bytes of garbage at startup to see if it's alive
+        #          - The 4 byte pid of the child once it is created
+        #          - The 4 byte exit status of child
+        if os.path.exists('forksrv_out'):
+            os.unlink('forksrv_out')
+        os.mkfifo('forksrv_out')
+        self._forksrv_out_fd = os.open('forksrv_out', os.O_RDWR)
+        os.dup2(self._forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
+
+        # FIFO #3: Used to pipe data into the process's stdin
+        if os.path.exists(INPUT_FILENAME):
+            os.unlink(INPUT_FILENAME)
+        self._target_in_fd = os.open(INPUT_FILENAME, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+        os.dup2(self._target_in_fd, 0)
+
+        cmd = ['./qemu-x86_64', self._prog] + self._args
+        print('[ * ] Launching fork server with command', ' '.join(cmd))
+        os.environ[SHM_ENV_VAR] = str(self._shm.shmid)
+        self._proc = subprocess.Popen(cmd,
+            stdout=open('/dev/null'), # Sink program output to /dev/null
+            stderr=open('/dev/null'))
+        if VERBOSE:
+            print('    Shared Memory Segment Id: %d' % self._shm.shmid)
+            print('    Fork server pid: %d' % self._proc.pid)
+        print('[ * ] Wating for fork server to become ready... ')
+        while True:
+            # Tight loop to wait for the fork server to come up. Select on the
+            # fifo to see if it's ready yet, and at the same time check to see
+            # if the process exited early (probably due to command line args)
+            r, w, x = select.select([FORKSRV_FD+1], [], [], 0)
+            if len(r) > 0: break
+            if self._proc.poll():
+                print('[ ! ] Fork server exited prematurely (code %d)' % self._proc.returncode)
+                sys.exit(1)
+        os.read(FORKSRV_FD+1, 4)
+
+    def spawn(self, stdin_data=None):
+        # Pump in test data
+        os.lseek(self._target_in_fd, 0, os.SEEK_SET)
+        os.write(self._target_in_fd, stdin_data)
+        os.ftruncate(self._target_in_fd, len(stdin_data))
+        os.lseek(self._target_in_fd, 0, os.SEEK_SET)
+
+        # Clear map
+        for i in range(MAP_SIZE):
+            self._shm_buf[i] = 0
+
+        # Spawn child
+        if VERBOSE: sys.stdout.write('[ * ] Launching')
+        self.start = time.time()
+        os.write(FORKSRV_FD, '0000')
+        inst_pid_enc = os.read(FORKSRV_FD+1, 4)
+        self.inst_pid = struct.unpack('<I', inst_pid_enc)[0]
+        if VERBOSE: print('(pid = %d)' % pid)
+    
+    def wait_for_completion(self, timeout=0):
+        if timeout > 0:
+            # Select on the forkserver output fd to wait for it to signal completion
+            # with a timeout
+            r, w, x = select.select([FORKSRV_FD+1], [], [], timeout)
+            if len(r) == 0:
+                print('Hang detected!\n')
+                os.kill(self.inst_pid, signal.SIGKILL)
+                return None
+
+        # Wait for child to exit
+        exit_enc = os.read(FORKSRV_FD+1, 4)
+        self.stop = time.time()
+        status = struct.unpack('<I', exit_enc)[0]
+        if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % status)
+
+        self.exit_signal = status & 0x7f
+        self.did_crash = self.exit_signal != 0
+        self.exit_code = (status & 0xff00) >> 8
+        self.did_core_dump = status & 0x80
+
+    def get_last_trace(self):
+        # Create new string buffer and clone map_buf into new buffer
+        clone = ctypes.create_string_buffer(MAP_SIZE)
+        memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
+        assert(memcmp(ctypes.byref(clone), self._shm.ptr, MAP_SIZE) == 0)
+        return clone
+    
+    def cleanup(self):
+        print('[ * ] Cleaning up')
+        if self._proc.poll() is None:
+            self._proc.kill()
+        os.close(self._forksrv_in_fd)
+        os.close(FORKSRV_FD)
+        os.unlink('forksrv_in')
+        os.close(self._forksrv_out_fd)
+        os.close(FORKSRV_FD+1)
+        os.unlink('forksrv_out')
+
+class Fuzzer(threading.Thread):
+    def __init__(self, backend, seed_paths=[], outputdir='output'):
+        super(Fuzzer, self).__init__()
+        self._backend                 = backend
+        self._stop_event              = threading.Event()
+        self._time_start              = 0
+        self._num_paths               = 0
+        self._last_path_time          = 0.0
+        self._num_crashes             = 0
+        self._last_crash_time         = 0.0
+        self._num_executions          = 0
+        self._stat_update_interval    = 0.25
+        self._stat_update_last        = 0
         self._stat_display_wheel_iter = 0
-        self._seeds = [TestCase.create_from_file(i) for i in seed_paths]
-        self._current_strategy = None
-        self._output_dir = outputdir
-        self._strategies = [NullStrategy, SequentialRuns] #SequentialInsertInterestingNumbersStrategy]#, SequentialBitFlipStrategy]
-        self._test_queue = []
-        self._strategy_queue = []
+        self._seeds                   = [TestCase.create_from_file(i) for i in seed_paths]
+        self._current_strategy        = None
+        self._output_dir              = outputdir
+        self._strategies              = [NullStrategy, SequentialBitFlipStrategy] # SequentialRuns, SequentialInsertInterestingNumbersStrategy, SequentialBitFlipStrategy]
+        self._test_queue              = []
+        self._strategy_queue          = []
     
     def time_elapsed_to_str(self, seconds):
         sec_per_min = 60
@@ -363,88 +490,14 @@ class Program(threading.Thread):
         self._stat_display_wheel_iter = (self._stat_display_wheel_iter + 1) % len(wheel_icon)
         sys.stdout.flush()
 
-    def clone_map(self):
-        # Create new string buffer and clone map_buf into new buffer
-        clone = ctypes.create_string_buffer(MAP_SIZE)
-        memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
-        assert(memcmp(ctypes.byref(clone), self._shm.ptr, MAP_SIZE) == 0)
-        return clone
-
-    def clear_map(self):
-        for i in range(MAP_SIZE):
-            self._shm_buf[i] = 0
-
     def init(self):
-        # Init shared memory region
-        print('[ * ] Initializing shared memory')
-        self._shm = SharedMem(MAP_SIZE)
-        self._shm_buf = (ctypes.c_uint8 * MAP_SIZE).from_address(self._shm.ptr)
-        for i in range(MAP_SIZE):
-            self._shm_buf[i] = 0
-
-        # Init fork server communication fifos
-        print('[ * ] Creating fork server FIFOs')
-
-        # FIFO #1: The fork server will read from this fifo before launching a
-        # new fork. Stuff in 4 bytes to launch a fork.
-        if os.path.exists('forksrv_in'):
-            os.unlink('forksrv_in')
-        os.mkfifo('forksrv_in')
-        self._forksrv_in_fd = os.open('forksrv_in', os.O_RDWR)
-        os.dup2(self._forksrv_in_fd, FORKSRV_FD) # QEMU expects this fd to be FORKSRV_FD
-
-        # FIFO #2: The fork server will write to this fifo:
-        #          - 4 bytes of garbage at startup to see if it's alive
-        #          - The 4 byte pid of the child once it is created
-        #          - The 4 byte exit status of child
-        if os.path.exists('forksrv_out'):
-            os.unlink('forksrv_out')
-        os.mkfifo('forksrv_out')
-        self._forksrv_out_fd = os.open('forksrv_out', os.O_RDWR)
-        os.dup2(self._forksrv_out_fd, FORKSRV_FD+1) # QEMU expects this fd to be FORKSRV_FD+1
-
-        # Fire up the fork sesrver
-        for i, x in enumerate(self._args):
-            if x == '@@':
-                self._args[i] = INPUT_FILENAME
-        cmd = ['./qemu-x86_64', self._prog] + self._args
-        print('[ * ] Launching fork server with command', ' '.join(cmd))
-        os.environ[SHM_ENV_VAR] = str(self._shm.shmid)
-        self._proc = subprocess.Popen(cmd,
-            stdout=open('/dev/null'), # Sink program output to /dev/null
-            stdin=open('/dev/null'),
-            stderr=open('/dev/null'))
-        if VERBOSE:
-            print('    Shared Memory Segment Id: %d' % self._shm.shmid)
-            print('    Fork server pid: %d' % self._proc.pid)
-        print('[ * ] Wating for fork server to become ready... ')
-        while True:
-            # Tight loop to wait for the fork server to come up. Select on the
-            # fifo to see if it's ready yet, and at the same time check to see
-            # if the process exited early (probably due to command line args)
-            r, w, x = select.select([FORKSRV_FD+1], [], [], 0)
-            if len(r) > 0: break
-            if self._proc.poll():
-                print('[ ! ] Fork server exited prematurely (code %d)' % self._proc.returncode)
-                sys.exit(1)
-        os.read(FORKSRV_FD+1, 4)
-
-    def cleanup(self):
-        if self._proc.poll() is None:
-            self._proc.kill()
-        os.close(self._forksrv_in_fd)
-        os.close(FORKSRV_FD)
-        os.close(self._forksrv_out_fd)
-        os.close(FORKSRV_FD+1)
-        os.unlink('forksrv_in')
-        os.unlink('forksrv_out')
-        if os.path.exists(INPUT_FILENAME):
-            os.unlink(INPUT_FILENAME)
+        # Fire up the backend
+        self._backend.initialize()
 
     def run(self):
+        # Perform basic startup tasks
         self.init()
 
-        # This is the main loop!
         self._time_start = time.time()
         print('[ * ] Starting! (C-c to exit!)')
 
@@ -477,45 +530,27 @@ class Program(threading.Thread):
                 self._current_strategy = None
                 continue
 
-            test_case.write_input_file(INPUT_FILENAME)
-            self.clear_map()
+            self._backend.spawn(test_case.data)
+            self._backend.wait_for_completion()
 
-            # Spawn child
-            if VERBOSE: sys.stdout.write('[ * ] Launching #%d ' % self._num_executions)
-            start = time.time()
-            os.write(FORKSRV_FD, '0000')
-            inst_pid_enc = os.read(FORKSRV_FD+1, 4)
-            if VERBOSE:
-                print('(pid = %d)' % struct.unpack('<I', inst_pid_enc))
-
-            # Wait for child to exit
-            exit_enc = os.read(FORKSRV_FD+1, 4)
-            stop = time.time()
-            status = struct.unpack('<I', exit_enc)[0]
-            if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % status)
-
-            exit_signal = status & 0x7f
-            did_crash = exit_signal != 0
-            exit_code = (status & 0xff00) >> 8
-            did_core_dump = status & 0x80
-
-            if did_crash:
-                if VERBOSE: print('(Process Terminated, Signal = %d)' % exit_signal)
+            if self._backend.did_crash:
+                if VERBOSE: print('(Process Terminated, Signal = %d)' % self._backend.exit_signal)
             else:
-                if VERBOSE: print('(Exit Normal, Code = %d)' % exit_code)
-            if VERBOSE: print('[ * ] Process executed for %f seconds' % (stop-start))
+                if VERBOSE: print('(Exit Normal, Code = %d)' % self._backend.exit_code)
+            duration = (self._backend.stop-self._backend.start)
+            if VERBOSE: print('[ * ] Process executed for %f seconds' % duration)
 
             # Create program trace object
-            trace = Trace(self.clone_map(),
-                did_crash=did_crash,
-                exit_signal=exit_signal,
-                exit_code=exit_code,
-                duration=(stop-start))
+            trace = Trace(self._backend.get_last_trace(),
+                did_crash=self._backend.did_crash,
+                exit_signal=self._backend.exit_signal,
+                exit_code=self._backend.exit_code,
+                duration=duration)
 
             if baseline is None:
                 baseline = trace
 
-            if did_crash:
+            if self._backend.did_crash:
                 self._num_crashes += 1
                 self._last_crash_time = time.time()
 
@@ -561,47 +596,47 @@ class Program(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
-        # if self._proc.poll() is None:
-        #     self._proc.kill()
+
+    def cleanup(self):
+        self._backend.cleanup()
+        if os.path.exists(INPUT_FILENAME):
+            os.unlink(INPUT_FILENAME)
 
 def main():
-    # Mirror AFL usage. Save everything before '--' and pass it through the
-    # argument parser, everything after should be process arguments.
-    fuzz_args = []
-    prog_args = []
-    for i, v in enumerate(sys.argv):
-        if v == '--':
-            fuzz_args = sys.argv[1:i]
-            prog_args = sys.argv[i+1:]
-            break
-    if len(fuzz_args) == 0:
-        fuzz_args = sys.argv[1:]
-
-    description = 'This program performs fuzzing of inputs to an arbitrary binary.'
-    usage = sys.argv[0] + ' -i <testcase_dir> -o <findings_dir> [options] -- /path/to/fuzzed/app [params]'
-    a = argparse.ArgumentParser(description=description, usage=usage)
-    a.add_argument('-i', '--inputdir',  required=True, help='seed input directory')
+    a = argparse.ArgumentParser(description='This program performs fuzzing of inputs to an arbitrary binary.')
+    a.add_argument('-Q', '--qemu',      help='use Qemu-based fuzzing', action='store_true')
+    a.add_argument('-V', '--valgrind',  help='use Valgrind-based fuzzing', action='store_true')
+    a.add_argument('-i', '--inputdir',  help='seed input directory', required=True)
     a.add_argument('-o', '--outputdir', help='output data directory')
-    a.add_argument('-v', '--verbose',   help='print debug output', action='store_true')
+    a.add_argument('--verbose',         help='print debug output', action='store_true')
+    a.add_argument('target',            help='path to target binary')
     a.set_defaults(inputdir='', outputdir='output')
-    args = a.parse_args(fuzz_args)
-
-    if len(prog_args) < 1:
-        a.print_usage()
-        sys.stderr.write('%s: error: please provide path to target\n' % os.path.basename(sys.argv[0]))
-        sys.exit(1)
-    target = prog_args[0]
+    args = a.parse_args()
 
     # Enable verbose logging
     global VERBOSE
     VERBOSE = args.verbose
+
+    if args.qemu == args.valgrind:
+        # Neither or both were selected!
+        sys.stderr.write('error: please select Qemu (-Q) OR Valgrind (-V)\n')
+        sys.exit(1)
+
+    # Create the backend
+    backend = None
+    if args.qemu:
+        backend = QemuBackend(args.target)
+    elif args.valgrind:
+        backend = ValgrindBackend(args.target)
+    else:
+        raise Exception('No backend')
 
     # Gather inputs from inputdir
     seed_paths = []
     if args.inputdir:
         seed_paths = [os.path.join(args.inputdir, p) for p in os.listdir(args.inputdir)]
 
-    p = Program(target, prog_args[1:], seed_paths, args.outputdir)
+    p = Fuzzer(backend, seed_paths, args.outputdir)
 
     try:
         p.start()
