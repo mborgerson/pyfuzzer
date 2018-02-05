@@ -648,18 +648,17 @@ class Fuzzer(threading.Thread):
                 self._last_crash_time = time.time()
 
                 # Save this test case
-                output_dir_path = os.path.join(self._output_dir, "crash_%d" % self._num_crashes)
-                os.makedirs(os.path.join(self._output_dir, "crash_%d" % self._num_crashes))
-                test_case.write_input_file(os.path.join(output_dir_path, 'input'))
+                os.makedirs(os.path.join(self._output_dir))
+                test_case.write_input_file(os.path.join(output_dir_path, 'input_%d' % self._num_crashes))
 
-                # Move core dump to crash directory
-                for f in os.listdir('.'):
-                    if f.endswith('.core'):
-                        os.rename(f, os.path.join(output_dir_path, os.path.basename(f)))
+                # # Move core dump to crash directory
+                # for f in os.listdir('.'):
+                #     if f.endswith('.core'):
+                #         os.rename(f, os.path.join(output_dir_path, os.path.basename(f)))
 
-                # Save which mutations were done against original seed
-                with open(os.path.join(output_dir_path, 'mutations.txt'), 'wb') as f:
-                    f.write(test_case.mutations)
+                # # Save which mutations were done against original seed
+                # with open(os.path.join(output_dir_path, 'mutations.txt'), 'wb') as f:
+                #     f.write(test_case.mutations)
 
                 # assert trace.compare_to(baseline)
 
