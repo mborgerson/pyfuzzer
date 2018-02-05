@@ -22,6 +22,8 @@ SHM_ENV_VAR = '__AFL_SHM_ID'
 
 INPUT_FILENAME = '__input_file'
 
+# Determine real path (resolve symbolic links to this script)
+ROOT_DIR = os.path.dirname(os.path.abspath(os.path.realpath(__file__ )))
 
 ###
 ### Following code is borrowed from https://github.com/albertz/playground/blob/master/shared_mem.py
@@ -364,7 +366,7 @@ class QemuBackend(Backend):
         self._target_in_fd = os.open(INPUT_FILENAME, os.O_RDWR | os.O_CREAT | os.O_EXCL)
         os.dup2(self._target_in_fd, 0)
 
-        cmd = ['./qemu-x86_64', self._prog] + self._args
+        cmd = [os.path.join(ROOT_DIR, 'qemu-x86_64'), self._prog] + self._args
         print('[ * ] Launching fork server with command', ' '.join(cmd))
         os.environ[SHM_ENV_VAR] = str(self._shm.shmid)
         self._proc = subprocess.Popen(cmd,
@@ -442,6 +444,8 @@ class QemuBackend(Backend):
         os.close(self._forksrv_out_fd)
         os.close(FORKSRV_FD+1)
         os.unlink('forksrv_out')
+        os.close(self._target_in_fd)
+        os.unlink(INPUT_FILENAME)
         pass
 
 class ValgrindBackend(Backend):
@@ -465,7 +469,7 @@ class ValgrindBackend(Backend):
         if VERBOSE: sys.stdout.write('[ * ] Launching')
         self.start = time.time()
 
-        cmd = ['valgrind', '--tool=lackey', '--trace-superblocks=yes', self._prog] + self._args
+        cmd = ['valgrind', '--tool=lackey', '--trace-superblocks=yes', os.path.abspath(self._prog)] + self._args
         if VERBOSE: print('[ * ] Launching process with command', ' '.join(cmd))
         self._proc = subprocess.Popen(cmd,
             stdout=subprocess.PIPE, # Sink program output to /dev/null
@@ -479,6 +483,7 @@ class ValgrindBackend(Backend):
 
         # Wait for child to exit
         p_stdout, p_stderr = self._proc.communicate()
+        # print(p_stdout)
         prev_loc = 0
         for x in re.findall('^SB ([a-fA-F0-9]+)', p_stderr, re.MULTILINE):
             cur_loc  = int(x, 16)
@@ -486,15 +491,6 @@ class ValgrindBackend(Backend):
             cur_loc &= MAP_SIZE - 1
             buf[cur_loc ^ prev_loc] = (buf[cur_loc ^ prev_loc] + 1) & 0xff
             prev_loc = cur_loc >> 1
-
-        # if timeout > 0:
-        #     # Select on the forkserver output fd to wait for it to signal completion
-        #     # with a timeout
-        #     r, w, x = select.select([FORKSRV_FD+1], [], [], timeout)
-        #     if len(r) == 0:
-        #         print('Hang detected!\n')
-        #         os.kill(self.inst_pid, signal.SIGKILL)
-        #         return None
 
         self.stop = time.time()
         self.did_crash = self._proc.returncode < 0
@@ -506,23 +502,14 @@ class ValgrindBackend(Backend):
             self.exit_signal = 0
 
     def get_last_trace(self):
-        # Create new string buffer and clone map_buf into new buffer
-        # clone = ctypes.create_string_buffer(MAP_SIZE)
-        # memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
-        # assert(memcmp(ctypes.byref(clone), self._shm.ptr, MAP_SIZE) == 0)
-        # return clone
         return self._trace
     
     def cleanup(self):
         print('[ * ] Cleaning up')
         if self._proc.poll() is None:
             self._proc.kill()
-        # os.close(self._forksrv_in_fd)
-        # os.close(FORKSRV_FD)
-        # os.unlink('forksrv_in')
-        # os.close(self._forksrv_out_fd)
-        # os.close(FORKSRV_FD+1)
-        # os.unlink('forksrv_out')
+        os.close(self._target_in_fd)
+        os.unlink(INPUT_FILENAME)
 
 class Fuzzer(threading.Thread):
     def __init__(self, backend, seed_paths=[], outputdir='output'):
@@ -648,8 +635,9 @@ class Fuzzer(threading.Thread):
                 self._last_crash_time = time.time()
 
                 # Save this test case
-                os.makedirs(os.path.join(self._output_dir))
-                test_case.write_input_file(os.path.join(output_dir_path, 'input_%d' % self._num_crashes))
+                if not os.path.exists(self._output_dir):
+                    os.makedirs(self._output_dir)
+                test_case.write_input_file(os.path.join(self._output_dir, 'input_%d' % self._num_crashes))
 
                 # # Move core dump to crash directory
                 # for f in os.listdir('.'):
@@ -665,7 +653,7 @@ class Fuzzer(threading.Thread):
             else:
                 # Didn't cause a crash, but could be interesting?
                 if trace.compare_to(baseline):
-                    # print('\nHmm, that\'s interesting...')
+                    print('\nHmm, that\'s interesting...')
                     self._test_queue.append(test_case)
 
             baseline.combine_total_paths(trace)
