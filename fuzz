@@ -305,12 +305,24 @@ class Backend(object):
         self._prog = target
         self._args = []
     
+    def initialize(self):
+        """Init the backend"""
+        pass
+
     def spawn(self):
         """Spawn a new instance of the target"""
         pass
 
+    def wait_for_completion(self, timeout=0):
+        """Wait for target process to complete"""
+        pass
+
     def get_last_trace(self):
         """Get the trace recorded by the last execution of the program"""
+        pass
+
+    def cleanup(self):
+        """Cleanup the backend"""
         pass
 
 class QemuBackend(Backend):
@@ -430,6 +442,87 @@ class QemuBackend(Backend):
         os.close(self._forksrv_out_fd)
         os.close(FORKSRV_FD+1)
         os.unlink('forksrv_out')
+        pass
+
+class ValgrindBackend(Backend):
+    def __init__(self, target):
+        super(ValgrindBackend, self).__init__(target)
+    
+    def initialize(self):
+        # FIFO #3: Used to pipe data into the process's stdin
+        if os.path.exists(INPUT_FILENAME):
+            os.unlink(INPUT_FILENAME)
+        self._target_in_fd = os.open(INPUT_FILENAME, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+        os.dup2(self._target_in_fd, 0)
+
+    def spawn(self, stdin_data=None):
+        # Pump in test data
+        os.lseek(self._target_in_fd, 0, os.SEEK_SET)
+        os.write(self._target_in_fd, stdin_data)
+        os.ftruncate(self._target_in_fd, len(stdin_data))
+        os.lseek(self._target_in_fd, 0, os.SEEK_SET)
+
+        if VERBOSE: sys.stdout.write('[ * ] Launching')
+        self.start = time.time()
+
+        cmd = ['valgrind', '--tool=lackey', '--trace-superblocks=yes', self._prog] + self._args
+        if VERBOSE: print('[ * ] Launching process with command', ' '.join(cmd))
+        self._proc = subprocess.Popen(cmd,
+            stdout=subprocess.PIPE, # Sink program output to /dev/null
+            stderr=subprocess.PIPE)
+    
+    def wait_for_completion(self, timeout=0):
+        self._trace = ctypes.create_string_buffer(MAP_SIZE)
+        buf = ctypes.cast(self._trace, ctypes.POINTER(ctypes.c_uint8))
+
+        import re
+
+        # Wait for child to exit
+        p_stdout, p_stderr = self._proc.communicate()
+        prev_loc = 0
+        for x in re.findall('^SB ([a-fA-F0-9]+)', p_stderr, re.MULTILINE):
+            cur_loc  = int(x, 16)
+            cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8)
+            cur_loc &= MAP_SIZE - 1
+            buf[cur_loc ^ prev_loc] = (buf[cur_loc ^ prev_loc] + 1) & 0xff
+            prev_loc = cur_loc >> 1
+
+        # if timeout > 0:
+        #     # Select on the forkserver output fd to wait for it to signal completion
+        #     # with a timeout
+        #     r, w, x = select.select([FORKSRV_FD+1], [], [], timeout)
+        #     if len(r) == 0:
+        #         print('Hang detected!\n')
+        #         os.kill(self.inst_pid, signal.SIGKILL)
+        #         return None
+
+        self.stop = time.time()
+        self.did_crash = self._proc.returncode < 0
+        self.exit_code = self._proc.returncode
+        if VERBOSE: sys.stdout.write('[ * ] Exit Status: %d ' % self.exit_code)
+        if self.did_crash:
+            self.exit_signal = 0 - self.exit_code
+        else:
+            self.exit_signal = 0
+
+    def get_last_trace(self):
+        # Create new string buffer and clone map_buf into new buffer
+        # clone = ctypes.create_string_buffer(MAP_SIZE)
+        # memcpy(ctypes.byref(clone), self._shm.ptr, MAP_SIZE)
+        # assert(memcmp(ctypes.byref(clone), self._shm.ptr, MAP_SIZE) == 0)
+        # return clone
+        return self._trace
+    
+    def cleanup(self):
+        print('[ * ] Cleaning up')
+        if self._proc.poll() is None:
+            self._proc.kill()
+        # os.close(self._forksrv_in_fd)
+        # os.close(FORKSRV_FD)
+        # os.unlink('forksrv_in')
+        # os.close(self._forksrv_out_fd)
+        # os.close(FORKSRV_FD+1)
+        # os.unlink('forksrv_out')
 
 class Fuzzer(threading.Thread):
     def __init__(self, backend, seed_paths=[], outputdir='output'):
