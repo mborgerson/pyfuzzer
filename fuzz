@@ -222,8 +222,13 @@ class SequentialBitFlipStrategy(MutationStrategy):
     def __init__(self, seed):
         self.seed = seed
         self.file_len = len(seed.data)
-        self.byte_pos = 0
-        self.bit_pos = 0
+
+        if hasattr(seed, 'start_byte_pos'):
+            self.byte_pos = seed.start_byte_pos
+            self.bit_pos = seed.start_bit_pos
+        else:
+            self.byte_pos = 0
+            self.bit_pos = 0
     
     def get_stats(self):
         """Returns (name, percent_complete)"""
@@ -237,10 +242,16 @@ class SequentialBitFlipStrategy(MutationStrategy):
         new_case = self.seed.clone()
         new_case.data[self.byte_pos] ^= 1 << self.bit_pos
         new_case.mutations += 'flip byte %x, bit %d\n' % (self.byte_pos, self.bit_pos)
+
         self.bit_pos += 1
         if self.bit_pos > 7:
             self.bit_pos = 0
             self.byte_pos += 1
+
+        # Let's just continue from last mutation instead of flipping every bit every time!
+        new_case.start_byte_pos = self.byte_pos
+        new_case.start_bit_pos = self.bit_pos
+
         return new_case
 
 class SequentialAddSubStrategy(MutationStrategy): pass
