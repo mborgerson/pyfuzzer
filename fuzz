@@ -254,7 +254,32 @@ class SequentialBitFlipStrategy(MutationStrategy):
 
         return new_case
 
-class SequentialAddSubStrategy(MutationStrategy): pass
+class SequentialAddSubStrategy(MutationStrategy): 
+    """Generates a test case according to sequential add/sub strategy"""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.file_len = len(seed.data)
+        self.byte_pos = 0
+        self.range = 2 # +- 2
+        self.sweep_step = 0 - self.range
+    
+    def get_stats(self):
+        """Returns (name, percent_complete)"""
+        return ('AddSub', (int)(100.0 * self.byte_pos / self.file_len))
+
+    def gen_test(self):
+        """Returns a new TestCase or None"""
+        if self.byte_pos >= self.file_len:
+            # Strategy complete
+            return None
+        new_case = self.seed.clone()
+        new_case.data[self.byte_pos] = (new_case.data[self.byte_pos] + self.sweep_step) & 0xff
+        self.sweep_step += 1
+        if self.sweep_step > self.range:
+            self.sweep_step = 0 - self.range
+            self.byte_pos += 1
+        return new_case
 
 class SequentialInsertInterestingNumbersStrategy(MutationStrategy):
     """Generates a test case according to sequential bit flipping strategy"""
@@ -472,6 +497,7 @@ class ValgrindBackend(Backend):
 
     def spawn(self, stdin_data=None):
         # Pump in test data
+        print(stdin_data, bin(stdin_data[0]))
         os.lseek(self._target_in_fd, 0, os.SEEK_SET)
         os.write(self._target_in_fd, stdin_data)
         os.ftruncate(self._target_in_fd, len(stdin_data))
@@ -539,7 +565,7 @@ class Fuzzer(threading.Thread):
         self._seeds                   = [TestCase.create_from_file(i) for i in seed_paths]
         self._current_strategy        = None
         self._output_dir              = outputdir
-        self._strategies              = [NullStrategy, SequentialBitFlipStrategy] # SequentialRuns, SequentialInsertInterestingNumbersStrategy, SequentialBitFlipStrategy]
+        self._strategies              = [NullStrategy, SequentialBitFlipStrategy, SequentialAddSubStrategy] # SequentialRuns, SequentialInsertInterestingNumbersStrategy, SequentialBitFlipStrategy]
         self._test_queue              = []
         self._strategy_queue          = []
     
