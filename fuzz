@@ -497,7 +497,6 @@ class ValgrindBackend(Backend):
 
     def spawn(self, stdin_data=None):
         # Pump in test data
-        print(stdin_data, bin(stdin_data[0]))
         os.lseek(self._target_in_fd, 0, os.SEEK_SET)
         os.write(self._target_in_fd, stdin_data)
         os.ftruncate(self._target_in_fd, len(stdin_data))
